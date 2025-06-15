@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
-import { Reservation, Payment, Room, RoomType } from "../models";
+import { sequelize, Reservation, Payment, Room, RoomType } from "../models";
+import { QueryTypes } from "sequelize";
 import { v4 as uuidv4 } from "uuid";
 import { Op } from "sequelize";
 
@@ -33,63 +34,42 @@ export const createReservation = async (req: Request, res: Response) => {
       return;
     }
 
-    const room = await Room.findByPk(roomId);
-    if (!room) {
-      res.status(404).json({
-        message: "Room not found",
-      });
+    const [roomResult] = await sequelize.query(
+      `SELECT * FROM "Rooms" WHERE id = :roomId LIMIT 1`,
+      {
+        replacements: { roomId },
+        type: QueryTypes.SELECT,
+      }
+    );
+
+    if (!roomResult) {
+      res.status(404).json({ message: "Room not found" });
       return;
     }
 
-    // Cek konflik reservasi
-    const conflictingReservations = await Reservation.findAll({
-      where: {
-        roomId: roomId,
-        [Op.or]: [
-          // Reservasi baru dimulai di tengah reservasi yang sudah ada
-          {
-            checkInDate: {
-              [Op.lte]: checkInDate,
-            },
-            checkOutDate: {
-              [Op.gt]: checkInDate,
-            },
-          },
-          // Reservasi baru berakhir di tengah reservasi yang sudah ada
-          {
-            checkInDate: {
-              [Op.lt]: checkOutDate,
-            },
-            checkOutDate: {
-              [Op.gte]: checkOutDate,
-            },
-          },
-          // Reservasi baru mencakup seluruh reservasi yang sudah ada
-          {
-            checkInDate: {
-              [Op.gte]: checkInDate,
-            },
-            checkOutDate: {
-              [Op.lte]: checkOutDate,
-            },
-          },
-        ],
-      },
-    });
+    const conflicts = await sequelize.query(
+      `
+      SELECT id, "checkInDate", "checkOutDate" FROM "Reservations"
+      WHERE "roomId" = :roomId AND (
+        ("checkInDate" <= :checkInDate AND "checkOutDate" > :checkInDate)
+        OR ("checkInDate" < :checkOutDate AND "checkOutDate" >= :checkOutDate)
+        OR ("checkInDate" >= :checkInDate AND "checkOutDate" <= :checkOutDate)
+      )
+      `,
+      {
+        replacements: { roomId, checkInDate, checkOutDate },
+        type: QueryTypes.SELECT,
+      }
+    );
 
-    if (conflictingReservations.length > 0) {
+    if (conflicts.length > 0) {
       res.status(409).json({
         message: "Room is not available for the selected dates",
-        conflictingReservations: conflictingReservations.map((r) => ({
-          id: r.id,
-          checkInDate: r.checkInDate,
-          checkOutDate: r.checkOutDate,
-        })),
+        conflictingReservations: conflicts,
       });
       return;
     }
 
-    // Buat reservasi jika tidak ada konflik
     const reservation = await Reservation.create({
       id: uuidv4(),
       roomId,
@@ -98,7 +78,6 @@ export const createReservation = async (req: Request, res: Response) => {
       totalAmount,
     });
 
-    // Buat pembayaran awal jika ada
     if (initialPayment && initialPayment > 0) {
       if (initialPayment > totalAmount) {
         res.status(400).json({
@@ -139,60 +118,26 @@ export const getReservationsByDate = async (req: Request, res: Response) => {
   }
 
   try {
-    const reservations = await Reservation.findAll({
-      where: {
-        [Op.or]: [
-          {
-            checkInDate: {
-              [Op.between]: [startDate, endDate],
-            },
-          },
-          {
-            checkOutDate: {
-              [Op.between]: [startDate, endDate],
-            },
-          },
-          {
-            checkInDate: {
-              [Op.lte]: startDate,
-            },
-            checkOutDate: {
-              [Op.gte]: endDate,
-            },
-          },
-        ],
-      },
-      include: [
-        {
-          model: Room,
-          include: [RoomType],
-        },
-        {
-          model: Payment,
-        },
-      ],
-    });
+    const reservations = await sequelize.query(
+      `
+      select r.id, r."checkInDate", r."checkOutDate", r."totalAmount", r2."roomNumber", rt."name" as "roomType", coalesce(sum(p.amount), 0) as "totalPaid", r."totalAmount"-coalesce(sum(p.amount), 0) as outstanding from "Reservations" r 
+join "Rooms" r2 on r."roomId" = r2.id
+join "RoomTypes" rt on r2."roomTypeId" = rt.id
+left join "Payments" p on p."reservationId" = r.id
+where 
+r."checkInDate" BETWEEN :startDate AND :endDate or
+r."checkOutDate" BETWEEN :startDate AND :endDate OR
+(r."checkInDate" <= :startDate AND r."checkOutDate" >= :endDate)
+group by r.id, r2.id, rt.id
+order by r."checkInDate" asc
+      `,
+      {
+        replacements: { startDate, endDate },
+        type: QueryTypes.SELECT,
+      }
+    );
 
-    const result = reservations.map((resv) => {
-      const totalPaid =
-        resv.Payments?.reduce((sum, p) => sum + p.amount, 0) || 0;
-      const outstanding = resv.totalAmount - totalPaid;
-
-      return {
-        id: resv.id,
-        checkInDate: resv.checkInDate,
-        checkOutDate: resv.checkOutDate,
-        totalAmount: resv.totalAmount,
-        totalPaid,
-        outstanding,
-        room: {
-          roomNumber: resv.Room?.roomNumber,
-          roomType: resv.Room?.RoomType?.name,
-        },
-      };
-    });
-
-    res.json(result);
+    res.json(reservations);
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Server error" });
@@ -200,35 +145,39 @@ export const getReservationsByDate = async (req: Request, res: Response) => {
 };
 
 export const addPaymentToReservation = async (req: Request, res: Response) => {
-  try {
-    const { id: reservationId } = req.params;
-    const { amount } = req.body;
+  const { id: reservationId } = req.params;
+  const { amount } = req.body;
 
-    if (!amount || amount <= 0) {
-      res.status(400).json({
-        message: "Amount is required and must be greater than 0",
-      });
-      return;
-    }
-
-    const reservation = await Reservation.findByPk(reservationId, {
-      include: [
-        {
-          model: Payment,
-        },
-      ],
+  if (!amount || amount <= 0) {
+    res.status(400).json({
+      message: "Amount is required and must be greater than 0",
     });
+    return;
+  }
+
+  try {
+    const reservationList = await sequelize.query(
+      `
+      SELECT r.*, COALESCE(SUM(p.amount), 0) AS "totalPaid"
+      FROM "Reservations" r
+      LEFT JOIN "Payments" p ON r.id = p."reservationId"
+      WHERE r.id = :reservationId
+      GROUP BY r.id
+      `,
+      {
+        replacements: { reservationId },
+        type: QueryTypes.SELECT,
+      }
+    );
+
+    const reservation: any = reservationList[0];
 
     if (!reservation) {
-      res.status(404).json({
-        message: "Reservation not found",
-      });
+      res.status(404).json({ message: "Reservation not found" });
       return;
     }
 
-    const totalPaid =
-      reservation.Payments?.reduce((sum, p) => sum + p.amount, 0) || 0;
-    const outstanding = reservation.totalAmount - totalPaid;
+    const outstanding = reservation.totalAmount - reservation.totalPaid;
 
     if (amount > outstanding) {
       res.status(400).json({
@@ -240,13 +189,13 @@ export const addPaymentToReservation = async (req: Request, res: Response) => {
 
     const payment = await Payment.create({
       id: uuidv4(),
-      reservationId: reservationId,
-      amount: amount,
+      reservationId,
+      amount,
       paidAt: new Date(),
     });
 
-    const newOutstanding = outstanding - amount;
-    const newTotalPaid = totalPaid + amount;
+    const newTotalPaid = reservation.totalPaid + amount;
+    const newOutstanding = reservation.totalAmount - newTotalPaid;
 
     res.status(201).json({
       message: "Payment added successfully",
